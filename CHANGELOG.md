@@ -4,6 +4,36 @@
 
 ---
 
+## [0.3.9] - 2026-08-29
+
+### 🛡️ 安全与健壮性修复 (Security & Robustness)
+
+- **学生端事件按身份过滤**：`student.view` 仅处理属于当前学生本人的点名与积分事件，修复「任何学生被点名/加分，所有学生端都收到个人化提醒」的错误；移除硬编码假数据（初始积分、100% 全勤、连续 12 堂签到），改为中性占位。
+- **修复排课数据污染**：移除 `syncAllToHost` 中「全部课节 × 全部班级」笛卡尔积生成 `schedules` 的逻辑（每次激活产生海量垃圾排课）；白板/专注力对学生识别由 `class_students` 关联保证。
+- **白板挂件去重**：`class_mgr.draw_widget` 按 `lessonId + teacherWidgetId` 去重，重复点击更新坐标/尺寸而非堆叠新卡片。
+- **悬浮加分挂件角色守卫**：仅教师角色注入右下角悬浮按钮，学生端不再出现教师操作入口；widget 别名从 4 个收敛为 2 个，避免重复挂件。
+
+### 🐛 修复 (Bug Fixes)
+
+- **补齐输入校验**：考勤 `status` 枚举校验、`delta` 限定 -100~100 整数、`classId`/班级名/学生姓名必填、批量/导入数量上限、点名 `count` 钳制 ≥1。
+- **消除关键路径静默吞错**：同步、索引创建、事务回滚、积分账本同步等 10 处改为 `ctx.log` 可见日志。
+- **事务重入保护**：宿主已开启事务或插件嵌套时直接透传执行，避免共享连接嵌套 BEGIN 崩溃。
+- **deactivate 资源清理**：注销全部已注册命令 Handler 与 AI Action。
+
+### ✨ 增强 (Enhancements)
+
+- **宿主积分账本集成（可选）**：通过 `IPointsLedgerService` / `IPointsDimensionRegistry` 尽力同步加分至宿主账本（含审计与维度统计），宿主未提供时自动降级为插件内积分。
+- **`gender_balance` 分组策略落地**：按性别分桶洗牌后交错轮转分配，保证各组性别均衡；策略参数非法时报错。
+- **教师端新增「添加学生」表单**：替换原「导入演示学生花名册」假数据按钮，支持学号(可选)+姓名录入。
+- **使用 SDK 官方 Token**：`IDatabaseToken` / `IPointsLedgerServiceToken` / `IPointsDimensionRegistryToken` 替换手写 Token hack（需 `uuid` 作为打包依赖）。
+
+### ⚠️ 已知限制
+
+- 白板元素仍为直写宿主 `whiteboard_elements` 表（已补 `whiteboard:write` 权限申报）；待宿主 `whiteboard.draw` 命令契约验证后再迁移。
+- 学生端初始积分显示 0，待下一次 `points_changed` 事件刷新。
+
+---
+
 ## [0.3.8] - 2026-08-28
 
 ### 🐛 修复 (Bug Fixes)

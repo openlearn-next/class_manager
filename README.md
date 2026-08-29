@@ -1,4 +1,4 @@
-# OpenLearn 班级与学生管理增强插件 (`@openlearn/class-manager`)
+# OpenLearn 班级与学生管理增强插件 (`@ext/class-manager`)
 
 为 **OpenLearn-Next** 提供全套班级花名册管理、动态分组、课堂随机点名、考勤签到与学生积分激励能力。
 
@@ -58,10 +58,8 @@ npm run build
 
 ---
 
-# OpenLearn 班级与学生管理增强插件 (`@ext/class-manager`)
-...
 ## 📄 架构声明 (Manifest)
 - **ID**: `@ext/class-manager`
 - **版本**: `0.3.8`
 - **适配引擎**: `openlearn: ">=0.2.0"`
-- **权限需求**: `lesson:read`, `lesson:write`, `management:read`, `management:write`
+- **权限需求**: `lesson:read`, `lesson:write`, `whiteboard:write`, `management:read`, `management:write`

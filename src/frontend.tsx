@@ -78,6 +78,8 @@ function TeacherTabPanel() {
   const [newClassName, setNewClassName] = React.useState<string>('');
   const [isCreatingClass, setIsCreatingClass] = React.useState<boolean>(false);
   const [groupCount, setGroupCount] = React.useState<number>(4);
+  const [newStudentNo, setNewStudentNo] = React.useState<string>('');
+  const [newStudentName, setNewStudentName] = React.useState<string>('');
 
   const loadClasses = React.useCallback(async () => {
     try {
@@ -177,29 +179,29 @@ function TeacherTabPanel() {
     }
   };
 
-  const handleImportMockStudents = async () => {
+  const handleAddStudent = async () => {
     if (!selectedClassId) {
       hostContext?.services?.uiService?.showToast?.('提示', '请先选择或新建一个班级', 'info');
       return;
     }
+    const name = newStudentName.trim();
+    if (!name) {
+      hostContext?.services?.uiService?.showToast?.('提示', '请输入学生姓名', 'info');
+      return;
+    }
     try {
-      const mockStudents = [
-        { studentNo: '1001', name: '张子涵', gender: 'male', tags: ['课代表', '数学优异'] },
-        { studentNo: '1002', name: '李雨桐', gender: 'female', tags: ['学习委员'] },
-        { studentNo: '1003', name: '王嘉尔', gender: 'male', tags: ['文体骨干'] },
-        { studentNo: '1004', name: '陈欣怡', gender: 'female', tags: ['活跃分子'] },
-        { studentNo: '1005', name: '刘浩宇', gender: 'male', tags: ['积极进取'] },
-        { studentNo: '1006', name: '赵梓萱', gender: 'female', tags: ['细致认真'] },
-      ];
+      const studentNo = newStudentNo.trim() || `S-${Date.now().toString().slice(-6)}`;
       await invokePluginCmd('class_mgr.student_batch_import', {
         classId: selectedClassId,
-        students: mockStudents,
+        students: [{ studentNo, name, gender: 'other' }],
       });
-      hostContext?.services?.uiService?.showToast?.('导入成功', '已导入示例学生花名册', 'success');
+      setNewStudentNo('');
+      setNewStudentName('');
+      hostContext?.services?.uiService?.showToast?.('添加成功', `已添加学生「${name}」`, 'success');
       loadStudents(selectedClassId);
       loadClasses();
     } catch (err: any) {
-      hostContext?.services?.uiService?.showToast?.('导入失败', err.message || String(err), 'warning');
+      hostContext?.services?.uiService?.showToast?.('添加失败', err.message || String(err), 'warning');
     }
   };
 
@@ -378,12 +380,31 @@ function TeacherTabPanel() {
 
       {/* 快捷操作条 */}
       <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap', alignItems: 'center' }}>
-        <button
-          onClick={handleImportMockStudents}
-          style={{ padding: '6px 12px', fontSize: 13, background: '#10b981', color: '#fff', border: 'none', borderRadius: 6, cursor: 'pointer' }}
-        >
-          📥 导入演示学生花名册
-        </button>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          <input
+            type="text"
+            placeholder="学号(可选)"
+            value={newStudentNo}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setNewStudentNo(e.target.value)}
+            style={{ padding: '6px 10px', fontSize: 13, borderRadius: 4, border: '1px solid #d1d5db', width: 90 }}
+          />
+          <input
+            type="text"
+            placeholder="学生姓名"
+            value={newStudentName}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setNewStudentName(e.target.value)}
+            onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
+              if (e.key === 'Enter') handleAddStudent();
+            }}
+            style={{ padding: '6px 10px', fontSize: 13, borderRadius: 4, border: '1px solid #d1d5db', width: 110 }}
+          />
+          <button
+            onClick={handleAddStudent}
+            style={{ padding: '6px 12px', fontSize: 13, background: '#10b981', color: '#fff', border: 'none', borderRadius: 6, cursor: 'pointer' }}
+          >
+            ＋ 添加学生
+          </button>
+        </div>
         <button
           onClick={handleSyncToHost}
           style={{ padding: '6px 12px', fontSize: 13, background: '#0284c7', color: '#fff', border: 'none', borderRadius: 6, cursor: 'pointer' }}
@@ -1285,18 +1306,28 @@ function TeacherFullPanel() {
 // ==========================================
 // 4. 学生端视图 (student.view)
 // ==========================================
-function StudentViewPanel() {
-  const [personalPoints, setPersonalPoints] = React.useState<number>(18);
+function StudentViewPanel(props: any) {
+  // student.view 宿主会注入当前学生身份 { studentId }；未注入时无法归属个人数据，展示中性占位
+  const myStudentId = props?.studentId;
+  const [personalPoints, setPersonalPoints] = React.useState<number>(0);
   const [calledAlert, setCalledAlert] = React.useState<string | null>(null);
 
-  // 监听学生端被点名与积分奖励事件
+  // 监听学生端被点名与积分奖励事件（仅处理属于当前学生本人的事件）
   React.useEffect(() => {
+    const isMine = (payload: any) => {
+      if (!myStudentId) return false; // 无身份上下文时不展示个人化提醒
+      if (!payload?.studentId) return false;
+      return payload.studentId === myStudentId;
+    };
+
     const unsubPick = eventHub.on('student_picked', (payload: any) => {
+      if (!isMine(payload)) return;
       setCalledAlert(`🔔 老师抽选了你回答问题: ${payload.studentName || ''}`);
       setTimeout(() => setCalledAlert(null), 5000);
     });
 
     const unsubPoints = eventHub.on('points_changed', (payload: any) => {
+      if (!isMine(payload)) return;
       setPersonalPoints(payload.currentPoints || 0);
       hostContext?.services?.uiService?.showToast?.(
         '⭐ 积分变动提醒',
@@ -1309,7 +1340,7 @@ function StudentViewPanel() {
       unsubPick();
       unsubPoints();
     };
-  }, []);
+  }, [myStudentId]);
 
   return (
     <div style={{ padding: 20, fontFamily: 'system-ui, sans-serif' }}>
@@ -1339,14 +1370,16 @@ function StudentViewPanel() {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
         <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: 16 }}>
           <h4 style={{ margin: '0 0 12px 0', fontSize: 15, color: '#374151' }}>🎯 我的积分徽章</h4>
-          <div style={{ fontSize: 28, fontWeight: 800, color: '#f59e0b' }}>⭐ {personalPoints} 积分</div>
-          <p style={{ fontSize: 12, color: '#6b7280', marginTop: 8 }}>WebSocket 实时同步最新课堂加分</p>
+          <div style={{ fontSize: 28, fontWeight: 800, color: '#f59e0b' }}>⭐ {myStudentId ? personalPoints : '—'} 积分</div>
+          <p style={{ fontSize: 12, color: '#6b7280', marginTop: 8 }}>
+            {myStudentId ? 'WebSocket 实时同步最新课堂加分' : '登录学生端后可查看个人实时积分'}
+          </p>
         </div>
 
         <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: 16 }}>
-          <h4 style={{ margin: '0 0 12px 0', fontSize: 15, color: '#374151' }}>📅 出勤全勤记录</h4>
-          <div style={{ fontSize: 28, fontWeight: 800, color: '#10b981' }}>100% 全勤</div>
-          <p style={{ fontSize: 12, color: '#6b7280', marginTop: 8 }}>连续 12 堂课准时签到</p>
+          <h4 style={{ margin: '0 0 12px 0', fontSize: 15, color: '#374151' }}>📅 考勤记录</h4>
+          <div style={{ fontSize: 22, fontWeight: 800, color: '#64748b' }}>暂无考勤数据</div>
+          <p style={{ fontSize: 12, color: '#6b7280', marginTop: 8 }}>教师录入考勤后此处将实时展示</p>
         </div>
       </div>
     </div>
@@ -1395,7 +1428,9 @@ async function activate(hostCtx: any) {
   });
 
   // 3. 注册课堂白板可拖拽组件（支持多别名与多 ID 匹配）
-  const widgetIds = ['class-mgr-widget', 'class-mgr-tool', '@ext/class-manager', 'class-manager-widget'];
+  // 规范 ID 为 class-mgr-widget（与 manifest.classroomTools payload 的 teacherWidgetId 一致）；
+  // 保留 class-mgr-tool 别名以兼容按工具 ID 寻址的宿主实现，避免重复挂件
+  const widgetIds = ['class-mgr-widget', 'class-mgr-tool'];
   widgetIds.forEach((id) => {
     registerExtension('teacher.dashboard.widget', {
       id,
@@ -1424,7 +1459,13 @@ async function activate(hostCtx: any) {
   });
 
   // 3c. 全局白板常驻即时加分悬浮窗（保证即使不在画布内插入卡片，老师随时在屏幕上点击加分）
-  try {
+  // 仅教师角色注入：学生端不出现教师操作按钮
+  const role = (hostCtx as any)?.user?.role || (hostCtx as any)?.auth?.role || (hostCtx as any)?.role;
+  const isStudentRole = role === 'student' || role === 'learner';
+  if (isStudentRole) {
+    console.debug('[@openlearn/class-manager] 学生角色，跳过教师悬浮加分挂件注入');
+  } else {
+    try {
     if (typeof document !== 'undefined') {
       const containerId = 'openlearn-class-mgr-floating-root';
       let container = document.getElementById(containerId);
@@ -1554,6 +1595,7 @@ async function activate(hostCtx: any) {
     }
   } catch (err) {
     console.warn('[@openlearn/class-manager] 注入全局悬浮加分挂件异常:', err);
+  }
   }
 
   // 4. 注册学生端视图

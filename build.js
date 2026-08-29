@@ -42,7 +42,7 @@ async function build() {
   const manifest = {
     id: '@ext/class-manager',
     name: '班级与学生管理增强',
-    version: '0.3.8',
+    version: '0.3.9',
     description: '提供班级花名册导入、智能分组、互动白板课堂单个/批量加减分、小组PK激励、原子白板投射与真实学情聚合统计',
     author: 'OpenLearn',
     engines: { openlearn: '>=0.2.0' },
@@ -52,7 +52,7 @@ async function build() {
       '@openlearn/core:IEventBusService@^1.0.0',
       '@openlearn/core:IDatabase@^1.0.0',
     ],
-    capabilitiesProposed: ['lesson:read', 'lesson:write', 'management:read', 'management:write'],
+    capabilitiesProposed: ['lesson:read', 'lesson:write', 'whiteboard:write', 'management:read', 'management:write'],
     contributes: {
       'classroom.tool': [
         {

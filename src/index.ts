@@ -1,3 +1,8 @@
+import {
+  IDatabaseToken,
+  IPointsLedgerServiceToken,
+  IPointsDimensionRegistryToken,
+} from '@openlearn/plugin-sdk';
 import type { PluginContext } from '@openlearn/plugin-sdk';
 import type {
   ClassItem,
@@ -8,13 +13,35 @@ import type {
   ClassSummaryReport,
 } from './types';
 
-const DATABASE_TOKEN = { name: '@openlearn/core:IDatabase' } as any;
+// 模块级资源追踪：deactivate 时按序注销命令 Handler / AI Action
+const registeredCommands = new Set<string>();
+const registeredActions: string[] = [];
+let activeServices: { commandBus: any; actionRegistry: any } | null = null;
+
+// 性别交错排序：各性别桶内先洗牌，再逐桶轮流抽取，配合轮转分组实现各组性别均衡
+function interleaveByGender(students: any[]): any[] {
+  const buckets = new Map<string, any[]>();
+  for (const s of students) {
+    const g = s.gender || 'other';
+    if (!buckets.has(g)) buckets.set(g, []);
+    buckets.get(g)!.push(s);
+  }
+  const shuffledBuckets = Array.from(buckets.values()).map((b) => [...b].sort(() => Math.random() - 0.5));
+  const result: any[] = [];
+  const maxLen = Math.max(0, ...shuffledBuckets.map((b) => b.length));
+  for (let i = 0; i < maxLen; i++) {
+    for (const bucket of shuffledBuckets) {
+      if (i < bucket.length) result.push(bucket[i]);
+    }
+  }
+  return result;
+}
 
 export default {
   manifest: {
     id: '@ext/class-manager',
     name: '班级与学生管理增强',
-    version: '0.3.8',
+    version: '0.3.9',
     description: '提供班级花名册导入、智能分组、互动白板课堂单个/批量加减分、小组PK激励、原子白板投射与真实学情聚合统计',
     author: 'OpenLearn',
     engines: { openlearn: '>=0.2.0' },
@@ -24,7 +51,7 @@ export default {
       '@openlearn/core:IEventBusService@^1.0.0',
       '@openlearn/core:IDatabase@^1.0.0',
     ],
-    capabilitiesProposed: ['lesson:read', 'lesson:write', 'management:read', 'management:write'],
+    capabilitiesProposed: ['lesson:read', 'lesson:write', 'whiteboard:write', 'management:read', 'management:write'],
     contributes: {
       'classroom.tool': [
         {
@@ -83,6 +110,29 @@ export default {
     const commandBus = ctx.services.commandBus;
     const actionRegistry = ctx.services.actionRegistry;
     const eventBus = ctx.services.eventBus;
+    activeServices = { commandBus, actionRegistry };
+
+    // 将未知类型错误转为可读字符串（ctx.log 的 meta 参数要求 Record<string, unknown>）
+    const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+    // 宿主积分账本（可选）：存在则同步写入以提供审计日志与维度统计；缺失时仅用插件内积分
+    let pointsLedger: any = null;
+    const pointsDimensionId = 'class_mgr_classroom_points';
+    try {
+      const dimRegistry: any = await ctx.resolve(IPointsDimensionRegistryToken);
+      dimRegistry.registerDimension?.({
+        id: pointsDimensionId,
+        name: '课堂积分',
+        description: '班级管理插件的白板课堂/班级管理加减分维度',
+      });
+    } catch (e) {
+      ctx.log.debug(`[class-manager] 宿主积分维度注册不可用，跳过: ${errMsg(e)}`);
+    }
+    try {
+      pointsLedger = await ctx.resolve(IPointsLedgerServiceToken);
+    } catch (e) {
+      ctx.log.debug(`[class-manager] 宿主积分账本服务不可用，仅使用插件内积分: ${errMsg(e)}`);
+    }
 
     // 1. 初始化插件增强私有数据库表结构
     await ctx.db.ensureTable('classes', `
@@ -133,11 +183,18 @@ export default {
     const attendanceTable = ctx.db.table('attendance');
 
     const getDb = async (): Promise<any> => {
-      return await ctx.resolve(DATABASE_TOKEN);
+      return await ctx.resolve(IDatabaseToken);
     };
 
-    // 异步事务封装：适配 Worker 跨线程 RPC 模式
+    // 事务重入保护：宿主若已开启事务（database.inTransaction）或本插件已嵌套，则直接透传执行，
+    // 原子性由外层事务保证，避免 SQLite 单写者下的嵌套 BEGIN 报错。
+    let inPluginTransaction = false;
     const withTransaction = async (database: any, fn: () => Promise<void>) => {
+      if (inPluginTransaction || database?.inTransaction) {
+        await fn();
+        return;
+      }
+      inPluginTransaction = true;
       await database.prepare('BEGIN TRANSACTION').run();
       try {
         await fn();
@@ -145,8 +202,12 @@ export default {
       } catch (err) {
         try {
           await database.prepare('ROLLBACK').run();
-        } catch (_) {}
+        } catch (rollbackErr) {
+          ctx.log.warn(`[class-manager] 事务回滚失败: ${errMsg(rollbackErr)}`);
+        }
         throw err;
+      } finally {
+        inPluginTransaction = false;
       }
     };
 
@@ -156,7 +217,9 @@ export default {
       await db.prepare(`CREATE INDEX IF NOT EXISTS idx_class_mgr_students_class ON ${studentsTable} (class_id)`).run();
       await db.prepare(`CREATE INDEX IF NOT EXISTS idx_class_mgr_attendance_class_lesson ON ${attendanceTable} (class_id, lesson_id)`).run();
       await db.prepare(`CREATE INDEX IF NOT EXISTS idx_class_mgr_groups_class ON ${groupsTable} (class_id)`).run();
-    } catch (_) {}
+    } catch (e) {
+      ctx.log.warn(`[class-manager] 创建检索索引失败（不影响核心功能）: ${errMsg(e)}`);
+    }
 
     // 双向全量补偿与宿主系统数据同步（确保宿主白板上课、专注力监控、排课 100% 可见插件班级与学生）
     const syncAllToHost = async (database: any) => {
@@ -176,7 +239,7 @@ export default {
           }
         }
       } catch (e) {
-        console.warn('[class-manager] 同步班级至宿主 classes 表失败:', e);
+        ctx.log.warn(`[class-manager] 同步班级至宿主 classes 表失败: ${errMsg(e)}`);
       }
 
       // 2. 同步学生与选课数据至宿主 students / class_students 表
@@ -197,23 +260,12 @@ export default {
           }
         }
       } catch (e) {
-        console.warn('[class-manager] 同步学生至宿主 students / class_students 表失败:', e);
+        ctx.log.warn(`[class-manager] 同步学生至宿主 students / class_students 表失败: ${errMsg(e)}`);
       }
 
-      // 3. 为白板上课系统补充排课 schedules 与进度初始化，确保白板专注力监控 100% 识别学生
-      try {
-        const lessons = await database.prepare(`SELECT id FROM lessons`).all();
-        const hostClasses = await database.prepare(`SELECT id FROM classes`).all();
-        if (Array.isArray(lessons) && Array.isArray(hostClasses)) {
-          for (const les of lessons) {
-            for (const cls of hostClasses) {
-              await database.prepare(
-                `INSERT OR IGNORE INTO schedules (id, class_id, lesson_id, scheduled_date, status, created_at) VALUES (?, ?, ?, ?, 'scheduled', ?)`
-              ).run(`${cls.id}_${les.id}`, cls.id, les.id, new Date().toISOString().slice(0, 10), now);
-            }
-          }
-        }
-      } catch (_) {}
+      // 3. 排课 schedules 同步已移除：原实现按「全部课节 × 全部班级」笛卡尔积生成排课，
+      //    会产生海量垃圾数据且语义错误（排课应归属宿主排课模块管理）。
+      //    白板/专注力对学生识别依赖的是 class_students 关联（步骤 2），已满足识别需求。
 
       return { syncedClasses, syncedStudents };
     };
@@ -221,16 +273,23 @@ export default {
     // 插件启动时立即执行一次全量补偿
     try {
       await syncAllToHost(db);
-    } catch (_) {}
+    } catch (e) {
+      ctx.log.warn(`[class-manager] 启动时全量同步失败: ${errMsg(e)}`);
+    }
 
     // 命令注册辅助器（同时注册 class_mgr.* 命名空间命令和短名命令，保证前后端 100% 互通）
     const regHandler = async (cmdType: string, handler: any) => {
       await commandBus.registerHandler(cmdType, handler);
+      registeredCommands.add(cmdType);
       if (cmdType.startsWith('class_mgr.')) {
         const shortType = cmdType.replace('class_mgr.', '');
         try {
           await commandBus.registerHandler(shortType, handler);
-        } catch (_) {}
+          registeredCommands.add(shortType);
+        } catch (e) {
+          // 短名已被宿主或其他插件占用（或宿主自动加命名空间前缀）：不覆盖，仅记录
+          ctx.log.debug(`[class-manager] 短名命令 ${shortType} 已存在，跳过别名注册`);
+        }
       }
     };
 
@@ -279,14 +338,40 @@ export default {
           ...dataObj,
         };
         const dataStr = JSON.stringify(finalData);
-        const elementId = crypto.randomUUID();
+        let elementId = crypto.randomUUID();
         const now = Date.now();
 
         try {
+          // 去重：同一课节下同一挂件只保留一个白板元素（重复点击=更新坐标/尺寸，而非堆叠新卡片）
+          let existingElement: any = null;
+          try {
+            const rows = await database.prepare(
+              `SELECT id, data FROM whiteboard_elements WHERE lesson_id = ? AND type = ?`
+            ).all(lessonId, payload.type || 'plugin');
+            if (Array.isArray(rows)) {
+              for (const row of rows) {
+                try {
+                  const parsed = JSON.parse(row.data || '{}');
+                  if (parsed.teacherWidgetId === finalData.teacherWidgetId) {
+                    existingElement = row;
+                    break;
+                  }
+                } catch (_) {}
+              }
+            }
+          } catch (e) {
+            ctx.log.debug(`[class_mgr.draw_widget] 查询既有白板元素失败: ${errMsg(e)}`);
+          }
+
           // 直接写入宿主系统的 whiteboard_elements 表
-          await database.prepare(
-            `INSERT INTO whiteboard_elements (id, lesson_id, type, data, created_at) VALUES (?, ?, ?, ?, ?)`
-          ).run(elementId, lessonId, payload.type || 'plugin', dataStr, now);
+          if (existingElement) {
+            elementId = existingElement.id;
+            await database.prepare(`UPDATE whiteboard_elements SET data = ? WHERE id = ?`).run(dataStr, existingElement.id);
+          } else {
+            await database.prepare(
+              `INSERT INTO whiteboard_elements (id, lesson_id, type, data, created_at) VALUES (?, ?, ?, ?, ?)`
+            ).run(elementId, lessonId, payload.type || 'plugin', dataStr, now);
+          }
 
           // 广播白板更新事件，触发白板画布立即拉取并渲染卡片
           try {
@@ -336,6 +421,10 @@ export default {
     await regHandler('class_mgr.class_create', {
       async execute(command: any) {
         const payload = (command.payload || {}) as { name: string; code?: string; grade?: string; description?: string };
+        const name = (payload.name || '').trim();
+        if (!name) {
+          throw new Error('无效的参数：班级名称不能为空');
+        }
         const id = crypto.randomUUID();
         const now = Date.now();
         const code = payload.code || `CLS-${Math.floor(1000 + Math.random() * 9000)}`;
@@ -346,7 +435,7 @@ export default {
         try {
           await database.prepare(
             `INSERT OR REPLACE INTO classes (id, name, description, created_at) VALUES (?, ?, ?, ?)`
-          ).run(id, payload.name, payload.description || '', now);
+          ).run(id, name, payload.description || '', now);
         } catch (e) {
           console.warn('[class-manager] 写入宿主 classes 表跳过:', e);
         }
@@ -354,18 +443,18 @@ export default {
         // 2. 写入插件增强表
         await database.prepare(
           `INSERT OR REPLACE INTO ${classesTable} (id, name, code, grade, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
-        ).run(id, payload.name, code, payload.grade || '', payload.description || '', now, now);
+        ).run(id, name, code, payload.grade || '', payload.description || '', now, now);
 
         await eventBus.publish({
           id: crypto.randomUUID(),
           type: 'class_mgr.class_created',
           source: 'plugin.class_mgr',
-          payload: { id, name: payload.name, code },
+          payload: { id, name, code },
           timestamp: now,
           correlationId: command.id,
         });
 
-        return { id, name: payload.name, code, message: `班级「${payload.name}」创建成功` };
+        return { id, name, code, message: `班级「${name}」创建成功` };
       },
     });
 
@@ -459,6 +548,14 @@ export default {
 
         if (!payload.classId || !Array.isArray(payload.students) || payload.students.length === 0) {
           throw new Error('无效的导入参数：classId 与 students 数组不能为空');
+        }
+        if (payload.students.length > 500) {
+          throw new Error('单次导入学生数量不能超过 500 人');
+        }
+        for (const stu of payload.students) {
+          if (!stu || typeof stu.name !== 'string' || !stu.name.trim()) {
+            throw new Error('导入学生数据无效：每条记录的 name 必填');
+          }
         }
 
         const database = await getDb();
@@ -604,6 +701,9 @@ export default {
         if (!payload.studentId || typeof payload.delta !== 'number') {
           throw new Error('无效的参数：studentId 与 delta 必填');
         }
+        if (!Number.isInteger(payload.delta) || Math.abs(payload.delta) > 100) {
+          throw new Error('无效的参数：delta 必须是 -100 ~ 100 之间的整数');
+        }
 
         const database = await getDb();
         const now = Date.now();
@@ -627,6 +727,22 @@ export default {
         }
 
         const updated = (await database.prepare(`SELECT * FROM ${studentsTable} WHERE id = ?`).get(payload.studentId)) as any;
+
+        // 尽力写入宿主积分账本（审计可追溯）；宿主未提供该服务时降级为插件内积分
+        try {
+          if (pointsLedger && updated) {
+            await pointsLedger.addPoints(
+              payload.studentId,
+              updated.class_id || '',
+              pointsDimensionId,
+              payload.delta,
+              payload.reason || '课堂加减分',
+              ctx.pluginId
+            );
+          }
+        } catch (e) {
+          ctx.log.debug(`[class-manager] 同步宿主积分账本失败: ${errMsg(e)}`);
+        }
 
         await eventBus.publish({
           id: crypto.randomUUID(),
@@ -663,6 +779,12 @@ export default {
 
         if (!Array.isArray(payload.studentIds) || payload.studentIds.length === 0 || typeof payload.delta !== 'number') {
           throw new Error('无效的参数：studentIds 列表与 delta 必填');
+        }
+        if (payload.studentIds.length > 200) {
+          throw new Error('单次批量操作的学生数量不能超过 200 人');
+        }
+        if (!Number.isInteger(payload.delta) || Math.abs(payload.delta) > 100) {
+          throw new Error('无效的参数：delta 必须是 -100 ~ 100 之间的整数');
         }
 
         const database = await getDb();
@@ -705,6 +827,21 @@ export default {
                 timestamp: now,
                 correlationId: command.id,
               });
+              // 尽力写入宿主积分账本（审计可追溯）
+              try {
+                if (pointsLedger) {
+                  await pointsLedger.addPoints(
+                    sId,
+                    updated.class_id || '',
+                    pointsDimensionId,
+                    payload.delta,
+                    payload.reason || '课堂加减分',
+                    ctx.pluginId
+                  );
+                }
+              } catch (e) {
+                ctx.log.debug(`[class-manager] 同步宿主积分账本失败: ${errMsg(e)}`);
+              }
             }
           }
         });
@@ -726,6 +863,13 @@ export default {
           groupCount: number;
           method?: 'random' | 'gender_balance';
         };
+
+        if (!payload.classId) {
+          throw new Error('无效的参数：classId 必填');
+        }
+        if (payload.method && !['random', 'gender_balance'].includes(payload.method)) {
+          throw new Error(`无效的分组策略：${payload.method}（允许：random / gender_balance）`);
+        }
 
         const database = await getDb();
         const students = await database.prepare(`SELECT * FROM ${studentsTable} WHERE class_id = ?`).all(payload.classId) as any[];
@@ -756,9 +900,11 @@ export default {
             groupIds.push(gId);
           }
 
+          // 按方法分配：random=随机洗牌均分；gender_balance=性别交错均分（各组性别均衡）
           const shuffled = [...students].sort(() => Math.random() - 0.5);
-          for (let idx = 0; idx < shuffled.length; idx++) {
-            const stu = shuffled[idx];
+          const ordered = payload.method === 'gender_balance' ? interleaveByGender(shuffled) : shuffled;
+          for (let idx = 0; idx < ordered.length; idx++) {
+            const stu = ordered[idx];
             const assignedGroupId = groupIds[idx % count];
             await database.prepare(`UPDATE ${studentsTable} SET group_id = ? WHERE id = ?`).run(assignedGroupId, stu.id);
           }
@@ -813,6 +959,10 @@ export default {
           excludeStudentIds?: string[];
         };
 
+        if (!payload.classId) {
+          throw new Error('无效的参数：classId 必填');
+        }
+
         const database = await getDb();
         let query = `SELECT * FROM ${studentsTable} WHERE class_id = ?`;
         const params: any[] = [payload.classId];
@@ -828,7 +978,7 @@ export default {
           throw new Error('无可抽选的学生候选人');
         }
 
-        const pickCount = Math.min(payload.count || 1, candidates.length);
+        const pickCount = Math.min(Math.max(1, Math.floor(payload.count || 1)), candidates.length);
         const shuffled = [...candidates].sort(() => Math.random() - 0.5);
         const picked = shuffled.slice(0, pickCount);
         const now = Date.now();
@@ -869,6 +1019,22 @@ export default {
           lessonId: string;
           records: { studentId: string; status: AttendanceStatus; remark?: string }[];
         };
+
+        if (!payload.classId || !payload.lessonId || !Array.isArray(payload.records) || payload.records.length === 0) {
+          throw new Error('无效的参数：classId、lessonId 与 records 数组必填');
+        }
+        if (payload.records.length > 500) {
+          throw new Error('单次考勤记录数不能超过 500 条');
+        }
+        const VALID_ATTENDANCE_STATUSES = ['present', 'late', 'leave', 'absent'];
+        for (const rec of payload.records) {
+          if (!rec || typeof rec.studentId !== 'string' || !rec.studentId) {
+            throw new Error('考勤记录无效：studentId 必填');
+          }
+          if (!VALID_ATTENDANCE_STATUSES.includes(rec.status)) {
+            throw new Error(`考勤状态无效：${rec.status}（允许：${VALID_ATTENDANCE_STATUSES.join('/')}）`);
+          }
+        }
 
         const database = await getDb();
         const now = Date.now();
@@ -941,6 +1107,10 @@ export default {
     await regHandler('class_mgr.class_summary', {
       async execute(command: any) {
         const payload = (command.payload || {}) as { classId: string };
+        if (!payload.classId) {
+          throw new Error('无效的参数：classId 必填');
+        }
+
         const database = await getDb();
 
         let className = '未知班级';
@@ -1020,7 +1190,12 @@ export default {
     });
 
     // 9. 注册 AI Agent Tools (ActionRegistry)
-    await actionRegistry.register({
+    const registerAction = async (descriptor: any) => {
+      await actionRegistry.register(descriptor);
+      registeredActions.push(descriptor.id);
+    };
+
+    await registerAction({
       id: 'class_mgr-ai-rollcall',
       commandType: 'class_mgr.rollcall_pick',
       description: 'AI 课堂智能随机抽选/点名学生回答问题或互动（支持宿主班级与增强班级）',
@@ -1036,7 +1211,7 @@ export default {
       },
     });
 
-    await actionRegistry.register({
+    await registerAction({
       id: 'class_mgr-ai-group',
       commandType: 'class_mgr.group_generate',
       description: 'AI 智能根据班级人数自动生成均衡协作小组（支持宿主原生班级学生）',
@@ -1052,7 +1227,7 @@ export default {
       },
     });
 
-    await actionRegistry.register({
+    await registerAction({
       id: 'class_mgr-ai-attendance-summary',
       commandType: 'class_mgr.class_summary',
       description: 'AI 汇总分析班级成员情况、分组分布、学情积分与综合活跃度（支持宿主班级）',
@@ -1066,7 +1241,7 @@ export default {
       },
     });
 
-    await actionRegistry.register({
+    await registerAction({
       id: 'class_mgr-ai-batch-points',
       commandType: 'class_mgr.student_batch_update_points',
       description: 'AI 课堂批量或针对特定学生/小组奖励或扣除积分',
@@ -1086,6 +1261,26 @@ export default {
   },
 
   async deactivate() {
-    // 清理资源
+    // 清理资源：注销本插件注册的命令 Handler 与 AI Action
+    // （事件订阅由宿主 ResourceTracker 在 deactivate 时自动取消，无需手动处理）
+    try {
+      if (activeServices) {
+        for (const type of registeredCommands) {
+          try {
+            await activeServices.commandBus.unregisterHandler(type);
+          } catch (_) {}
+        }
+        for (const id of registeredActions) {
+          try {
+            await activeServices.actionRegistry.unregister(id);
+          } catch (_) {}
+        }
+      }
+    } catch (e) {
+      console.warn('[class-manager] deactivate 清理资源异常:', e);
+    }
+    registeredCommands.clear();
+    registeredActions.length = 0;
+    activeServices = null;
   },
 };
