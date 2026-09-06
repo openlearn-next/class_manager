@@ -1246,8 +1246,8 @@ function TeacherFullPanel() {
             </div>
             <div style={{ background: '#fff', padding: 16, borderRadius: 8, border: '1px solid #e2e8f0' }}>
               <div style={{ fontSize: 13, color: '#64748b' }}>加权出勤率</div>
-              <div style={{ fontSize: 26, fontWeight: 700, color: summary.attendanceRate >= 90 ? '#10b981' : '#f59e0b', marginTop: 4 }}>
-                {summary.attendanceRate}%
+              <div style={{ fontSize: 26, fontWeight: 700, color: (summary.attendanceRate ?? 0) >= 90 ? '#10b981' : '#f59e0b', marginTop: 4 }}>
+                {summary.attendanceRate == null ? '—' : `${summary.attendanceRate}%`}
               </div>
             </div>
             <div style={{ background: '#fff', padding: 16, borderRadius: 8, border: '1px solid #e2e8f0' }}>
@@ -1482,11 +1482,8 @@ async function activate(hostCtx: any) {
           const unsub = eventHub.on('open_floating_widget', () => {
             setIsOpen(true);
           });
-          const handleCustomEvt = () => setIsOpen(true);
-          window.addEventListener('class_mgr_open_floating', handleCustomEvt);
           return () => {
             unsub();
-            window.removeEventListener('class_mgr_open_floating', handleCustomEvt);
           };
         }, []);
 

@@ -12,7 +12,7 @@
   - 白板可拖拽点名小挂件，支持抽奖动效随机抽选。
   - 课堂出勤状态（出勤/迟到/请假/旷课）快捷记录与统计。
 - **学生积分激励**：课堂表现加减分（积极发言 +2、答题正确 +5 等），学生端自主查看。
-- **AI Agent 工具赋能**：内置 3 个 AI Actions，支持 AI 助教通过自然语言执行点名、自动分组与学情总结。
+- **AI Agent 工具赋能**：内置 4 个 AI Actions，支持 AI 助教通过自然语言执行点名、自动分组、批量加减分与学情总结。
 - **多端 UI 扩展**：深度适配 `teacher.tab`、`teacher.panel`、`classroom.tool`、`teacher.dashboard.widget` 与 `student.view`。
 
 ---
@@ -55,11 +55,12 @@ npm run build
 - `class_mgr-ai-rollcall`：AI 智能课堂随机抽问/点名
 - `class_mgr-ai-group`：AI 智能分组算法
 - `class_mgr-ai-attendance-summary`：AI 学情与考勤综合总结
+- `class_mgr-ai-batch-points`：AI 课堂批量/针对性加减分
 
 ---
 
 ## 📄 架构声明 (Manifest)
 - **ID**: `@ext/class-manager`
-- **版本**: `0.3.8`
-- **适配引擎**: `openlearn: ">=0.2.0"`
+- **版本**: `0.3.9`
+- **适配引擎**: `openlearn: ">=0.2.5"`
 - **权限需求**: `lesson:read`, `lesson:write`, `whiteboard:write`, `management:read`, `management:write`

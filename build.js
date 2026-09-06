@@ -43,15 +43,17 @@ async function build() {
     id: '@ext/class-manager',
     name: '班级与学生管理增强',
     version: '0.3.9',
+    main: 'index.js',
     description: '提供班级花名册导入、智能分组、互动白板课堂单个/批量加减分、小组PK激励、原子白板投射与真实学情聚合统计',
     author: 'OpenLearn',
-    engines: { openlearn: '>=0.2.0' },
+    engines: { openlearn: '>=0.2.5' },
     requires: [
       '@openlearn/core:ICommandBusService@^1.0.0',
       '@openlearn/core:IActionRegistryService@^1.0.0',
       '@openlearn/core:IEventBusService@^1.0.0',
       '@openlearn/core:IDatabase@^1.0.0',
     ],
+    pluginDependencies: ['@openlearn/plugin-management', '@openlearn/plugin-builtin'],
     capabilitiesProposed: ['lesson:read', 'lesson:write', 'whiteboard:write', 'management:read', 'management:write'],
     contributes: {
       'classroom.tool': [

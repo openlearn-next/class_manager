@@ -83,7 +83,7 @@ export interface ClassSummaryReport {
   className: string;
   totalStudents: number;
   totalGroups: number;
-  attendanceRate: number;
+  attendanceRate: number | null;
   attendanceStats: AttendanceAggregateStats;
   pointsStats: PointsAggregateStats;
   topActiveStudents: { name: string; points: number }[];

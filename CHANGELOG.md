@@ -4,6 +4,39 @@
 
 ---
 
+## [0.3.11] - 2026-09-06
+
+### 🐛 修复 (Bug Fixes)
+
+- **引擎版本纠正**：`engines.openlearn` 统一为 `>=0.2.5`（宿主当前为 0.3.x 版本线，官方推荐向前兼容声明）；上版误写的 `>=5.1.0` 会被 SemVer 判定不兼容而拒载，已回滚。
+- **补齐 manifest `main` 字段**：新规范中 `main` 为必填字段（入口文件名），补为 `"index.js"`。
+
+### ⚡ 增强 (Enhancements)
+
+- **白板挂件迁移到宿主命令**：`class_mgr.draw_widget` 改用 `whiteboard.query` / `whiteboard.draw` / `whiteboard.update` 命令，不再直写宿主 `whiteboard_elements` 表。
+- **班级创建迁移到宿主命令**：`class_mgr.class_create` 改用 `class.create` 命令，宿主生成 `classId`；插件增强表仍保存 `code`/`grade` 等扩展字段。
+- **学生导入迁移到宿主命令**：`class_mgr.student_batch_import` 改用 `student.list` 查重 + `student.create` / `class.add_student` 命令，移除宿主 `students` / `class_students` 表直写。
+- **全量同步迁移到宿主命令**：`syncAllToHost` 改用 `class.list` / `student.list` 比对 + `class.create` / `student.create` / `class.add_student` 幂等补建，并级联更新插件表引用；不再直写宿主表。
+
+## [0.3.10] - 2026-09-06
+
+### 🐛 修复 (Bug Fixes)
+
+- **学生查重串号**：`student_batch_import` 去重改为仅按 `student_number` 匹配，重名学生不再互相覆盖；插件表改为 UPSERT，重导入时保留已有积分与分组。
+- **事务内异步 I/O 移出**：`student_batch_update_points` 将事件发布与宿主积分账本写入移出事务，消除并发交错与“外层回滚连带内层”风险。
+- **出勤率语义修正**：无考勤记录时 `attendanceRate` 返回 `null`（不再显示 100%），前端显示「—」。
+
+### ⚡ 增强 (Enhancements)
+
+- **均匀洗牌**：分组/点名改用 Fisher-Yates 洗牌，替代有偏的 `sort(() => Math.random() - 0.5)`。
+- **tags 解析保护**：脏数据降级为空数组，避免花名册查询整体失败。
+
+### 🛡️ 安全与兼容性 (Security & Compatibility)
+
+- **引擎版本规范化**：`engines.openlearn` 统一为 `>=0.2.5`（官方推荐向前兼容声明，宿主当前为 0.3.x 版本线）。
+- **清理死代码与死依赖**：移除未使用的 `uuid` 依赖与 `class_mgr_open_floating` 死事件监听。
+- **AI 工具 schema 补全**：`class_mgr-ai-batch-points` 的 `studentIds` 数组参数补齐 `items` 类型。
+
 ## [0.3.9] - 2026-08-29
 
 ### 🛡️ 安全与健壮性修复 (Security & Robustness)
@@ -25,7 +58,7 @@
 - **宿主积分账本集成（可选）**：通过 `IPointsLedgerService` / `IPointsDimensionRegistry` 尽力同步加分至宿主账本（含审计与维度统计），宿主未提供时自动降级为插件内积分。
 - **`gender_balance` 分组策略落地**：按性别分桶洗牌后交错轮转分配，保证各组性别均衡；策略参数非法时报错。
 - **教师端新增「添加学生」表单**：替换原「导入演示学生花名册」假数据按钮，支持学号(可选)+姓名录入。
-- **使用 SDK 官方 Token**：`IDatabaseToken` / `IPointsLedgerServiceToken` / `IPointsDimensionRegistryToken` 替换手写 Token hack（需 `uuid` 作为打包依赖）。
+- **使用 SDK 官方 Token**：`IDatabaseToken` / `IPointsLedgerServiceToken` / `IPointsDimensionRegistryToken` 替换手写 Token hack。
 
 ### ⚠️ 已知限制
 

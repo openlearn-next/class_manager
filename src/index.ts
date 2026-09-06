@@ -18,6 +18,27 @@ const registeredCommands = new Set<string>();
 const registeredActions: string[] = [];
 let activeServices: { commandBus: any; actionRegistry: any } | null = null;
 
+// Fisher-Yates 均匀洗牌（替代有偏的 sort(() => Math.random() - 0.5)）
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// 安全解析 JSON 数组（tags 列），脏数据降级为空数组，避免花名册查询整体失败
+function parseTags(raw: any): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 // 性别交错排序：各性别桶内先洗牌，再逐桶轮流抽取，配合轮转分组实现各组性别均衡
 function interleaveByGender(students: any[]): any[] {
   const buckets = new Map<string, any[]>();
@@ -26,7 +47,7 @@ function interleaveByGender(students: any[]): any[] {
     if (!buckets.has(g)) buckets.set(g, []);
     buckets.get(g)!.push(s);
   }
-  const shuffledBuckets = Array.from(buckets.values()).map((b) => [...b].sort(() => Math.random() - 0.5));
+  const shuffledBuckets = Array.from(buckets.values()).map((b) => shuffle(b));
   const result: any[] = [];
   const maxLen = Math.max(0, ...shuffledBuckets.map((b) => b.length));
   for (let i = 0; i < maxLen; i++) {
@@ -42,15 +63,17 @@ export default {
     id: '@ext/class-manager',
     name: '班级与学生管理增强',
     version: '0.3.9',
+    main: 'index.js',
     description: '提供班级花名册导入、智能分组、互动白板课堂单个/批量加减分、小组PK激励、原子白板投射与真实学情聚合统计',
     author: 'OpenLearn',
-    engines: { openlearn: '>=0.2.0' },
+    engines: { openlearn: '>=0.2.5' },
     requires: [
       '@openlearn/core:ICommandBusService@^1.0.0',
       '@openlearn/core:IActionRegistryService@^1.0.0',
       '@openlearn/core:IEventBusService@^1.0.0',
       '@openlearn/core:IDatabase@^1.0.0',
     ],
+    pluginDependencies: ['@openlearn/plugin-management', '@openlearn/plugin-builtin'],
     capabilitiesProposed: ['lesson:read', 'lesson:write', 'whiteboard:write', 'management:read', 'management:write'],
     contributes: {
       'classroom.tool': [
@@ -221,51 +244,97 @@ export default {
       ctx.log.warn(`[class-manager] 创建检索索引失败（不影响核心功能）: ${errMsg(e)}`);
     }
 
-    // 双向全量补偿与宿主系统数据同步（确保宿主白板上课、专注力监控、排课 100% 可见插件班级与学生）
+    // 幂等补偿同步：将插件私有表的班级/学生补建到宿主（走宿主命令，避免直写宿主表）。
+    // 注意：class_create / student_batch_import 已走命令，新数据天然在宿主表，此处仅补偿历史孤儿数据。
     const syncAllToHost = async (database: any) => {
-      const now = Date.now();
       let syncedClasses = 0;
       let syncedStudents = 0;
 
-      // 1. 同步班级数据至宿主 classes 表
+      // 1. 班级同步：比对插件表与宿主 class.list，缺失的补建并级联更新插件表引用
+      const hostClassIds = new Set<string>();
       try {
-        const pluginClasses = await database.prepare(`SELECT * FROM ${classesTable}`).all();
-        if (Array.isArray(pluginClasses)) {
-          for (const cls of pluginClasses) {
-            await database.prepare(
-              `INSERT OR REPLACE INTO classes (id, name, description, created_at) VALUES (?, ?, ?, ?)`
-            ).run(cls.id, cls.name, cls.description || '', cls.created_at || now);
-            syncedClasses++;
-          }
+        const listCmd = await commandBus.createCommand('class.list', {}, ctx.pluginId);
+        const listRes = (await commandBus.execute(listCmd)) as any;
+        for (const c of listRes?.classes || []) {
+          if (c.id) hostClassIds.add(c.id);
         }
       } catch (e) {
-        ctx.log.warn(`[class-manager] 同步班级至宿主 classes 表失败: ${errMsg(e)}`);
+        ctx.log.warn(`[class-manager] 拉取宿主班级列表失败: ${errMsg(e)}`);
       }
 
-      // 2. 同步学生与选课数据至宿主 students / class_students 表
-      try {
-        const pluginStudents = await database.prepare(`SELECT * FROM ${studentsTable}`).all();
-        if (Array.isArray(pluginStudents)) {
-          for (const stu of pluginStudents) {
-            await database.prepare(
-              `INSERT OR REPLACE INTO students (id, student_number, name, email, created_at) VALUES (?, ?, ?, ?, ?)`
-            ).run(stu.id, stu.student_no, stu.name, '', stu.created_at || now);
+      const pluginClasses = (await database.prepare(`SELECT * FROM ${classesTable}`).all()) as any[];
+      for (const cls of Array.isArray(pluginClasses) ? pluginClasses : []) {
+        if (hostClassIds.has(cls.id)) {
+          syncedClasses++;
+          continue;
+        }
+        try {
+          const createCmd = await commandBus.createCommand(
+            'class.create',
+            { name: cls.name, description: cls.description || '' },
+            ctx.pluginId
+          );
+          const createRes = (await commandBus.execute(createCmd)) as any;
+          if (createRes?.classId && createRes.classId !== cls.id) {
+            await database.prepare(`UPDATE ${classesTable} SET id = ? WHERE id = ?`).run(createRes.classId, cls.id);
+            await database.prepare(`UPDATE ${studentsTable} SET class_id = ? WHERE class_id = ?`).run(createRes.classId, cls.id);
+            await database.prepare(`UPDATE ${groupsTable} SET class_id = ? WHERE class_id = ?`).run(createRes.classId, cls.id);
+            await database.prepare(`UPDATE ${attendanceTable} SET class_id = ? WHERE class_id = ?`).run(createRes.classId, cls.id);
+          }
+          syncedClasses++;
+        } catch (e) {
+          ctx.log.warn(`[class-manager] 补建班级失败（${cls.name}）: ${errMsg(e)}`);
+        }
+      }
 
-            if (stu.class_id) {
-              await database.prepare(
-                `INSERT OR REPLACE INTO class_students (class_id, student_id, joined_at) VALUES (?, ?, ?)`
-              ).run(stu.class_id, stu.id, stu.created_at || now);
+      // 2. 学生同步：比对插件表与宿主 student.list，缺失的补建并级联更新插件表引用
+      const hostStudentIds = new Set<string>();
+      try {
+        const listCmd = await commandBus.createCommand('student.list', {}, ctx.pluginId);
+        const listRes = (await commandBus.execute(listCmd)) as any;
+        for (const s of listRes?.students || []) {
+          if (s.id) hostStudentIds.add(s.id);
+        }
+      } catch (e) {
+        ctx.log.warn(`[class-manager] 拉取宿主学生列表失败: ${errMsg(e)}`);
+      }
+
+      const pluginStudents = (await database.prepare(`SELECT * FROM ${studentsTable}`).all()) as any[];
+      for (const stu of Array.isArray(pluginStudents) ? pluginStudents : []) {
+        if (hostStudentIds.has(stu.id)) {
+          syncedStudents++;
+          continue;
+        }
+        try {
+          const createCmd = await commandBus.createCommand(
+            'student.create',
+            { name: stu.name, student_number: stu.student_no || '' },
+            ctx.pluginId
+          );
+          const createRes = (await commandBus.execute(createCmd)) as any;
+          const newStudentId = createRes?.studentId || stu.id;
+          if (newStudentId !== stu.id) {
+            await database.prepare(`UPDATE ${studentsTable} SET id = ? WHERE id = ?`).run(newStudentId, stu.id);
+            await database.prepare(`UPDATE ${groupsTable} SET leader_student_id = ? WHERE leader_student_id = ?`).run(newStudentId, stu.id);
+            await database.prepare(`UPDATE ${attendanceTable} SET student_id = ? WHERE student_id = ?`).run(newStudentId, stu.id);
+          }
+          if (stu.class_id) {
+            try {
+              const addCmd = await commandBus.createCommand(
+                'class.add_student',
+                { classId: stu.class_id, studentId: newStudentId },
+                ctx.pluginId
+              );
+              await commandBus.execute(addCmd);
+            } catch (e) {
+              ctx.log.warn(`[class-manager] 补建学生选课关联失败（${stu.name}）: ${errMsg(e)}`);
             }
-            syncedStudents++;
           }
+          syncedStudents++;
+        } catch (e) {
+          ctx.log.warn(`[class-manager] 补建学生失败（${stu.name}）: ${errMsg(e)}`);
         }
-      } catch (e) {
-        ctx.log.warn(`[class-manager] 同步学生至宿主 students / class_students 表失败: ${errMsg(e)}`);
       }
-
-      // 3. 排课 schedules 同步已移除：原实现按「全部课节 × 全部班级」笛卡尔积生成排课，
-      //    会产生海量垃圾数据且语义错误（排课应归属宿主排课模块管理）。
-      //    白板/专注力对学生识别依赖的是 class_students 关联（步骤 2），已满足识别需求。
 
       return { syncedClasses, syncedStudents };
     };
@@ -338,16 +407,21 @@ export default {
           ...dataObj,
         };
         const dataStr = JSON.stringify(finalData);
+        const elementType = payload.type || 'plugin';
         let elementId = crypto.randomUUID();
         const now = Date.now();
 
         try {
-          // 去重：同一课节下同一挂件只保留一个白板元素（重复点击=更新坐标/尺寸，而非堆叠新卡片）
+          // 去重：通过宿主白板查询命令查找同类型元素，识别同一挂件（重复点击=更新，而非堆叠）
           let existingElement: any = null;
           try {
-            const rows = await database.prepare(
-              `SELECT id, data FROM whiteboard_elements WHERE lesson_id = ? AND type = ?`
-            ).all(lessonId, payload.type || 'plugin');
+            const queryCmd = await commandBus.createCommand(
+              'whiteboard.query',
+              { lessonId, filter: { type: elementType } },
+              ctx.pluginId
+            );
+            const queryRes = (await commandBus.execute(queryCmd)) as any;
+            const rows = queryRes?.elements;
             if (Array.isArray(rows)) {
               for (const row of rows) {
                 try {
@@ -363,14 +437,23 @@ export default {
             ctx.log.debug(`[class_mgr.draw_widget] 查询既有白板元素失败: ${errMsg(e)}`);
           }
 
-          // 直接写入宿主系统的 whiteboard_elements 表
+          // 通过宿主白板命令写入/更新元素（走 CommandBus 校验与审计链路）
           if (existingElement) {
             elementId = existingElement.id;
-            await database.prepare(`UPDATE whiteboard_elements SET data = ? WHERE id = ?`).run(dataStr, existingElement.id);
+            const updCmd = await commandBus.createCommand(
+              'whiteboard.update',
+              { lessonId, elementId, data: dataStr },
+              ctx.pluginId
+            );
+            await commandBus.execute(updCmd);
           } else {
-            await database.prepare(
-              `INSERT INTO whiteboard_elements (id, lesson_id, type, data, created_at) VALUES (?, ?, ?, ?, ?)`
-            ).run(elementId, lessonId, payload.type || 'plugin', dataStr, now);
+            const drawCmd = await commandBus.createCommand(
+              'whiteboard.draw',
+              { lessonId, type: elementType, data: dataStr },
+              ctx.pluginId
+            );
+            const drawRes = (await commandBus.execute(drawCmd)) as any;
+            elementId = drawRes?.elementId || elementId;
           }
 
           // 广播白板更新事件，触发白板画布立即拉取并渲染卡片
@@ -425,22 +508,28 @@ export default {
         if (!name) {
           throw new Error('无效的参数：班级名称不能为空');
         }
-        const id = crypto.randomUUID();
+        let id = crypto.randomUUID();
         const now = Date.now();
         const code = payload.code || `CLS-${Math.floor(1000 + Math.random() * 9000)}`;
 
         const database = await getDb();
 
-        // 1. 优先同步写入宿主原生 classes 表（让白板系统与其他内置模块立即可见）
+        // 1. 通过宿主管理插件命令创建班级（走 CommandBus 校验/审计链路，宿主生成 classId）
         try {
-          await database.prepare(
-            `INSERT OR REPLACE INTO classes (id, name, description, created_at) VALUES (?, ?, ?, ?)`
-          ).run(id, name, payload.description || '', now);
+          const hostCmd = await commandBus.createCommand(
+            'class.create',
+            { name, description: payload.description || '' },
+            ctx.pluginId
+          );
+          const hostRes = (await commandBus.execute(hostCmd)) as any;
+          if (hostRes?.classId) {
+            id = hostRes.classId;
+          }
         } catch (e) {
-          console.warn('[class-manager] 写入宿主 classes 表跳过:', e);
+          ctx.log.warn(`[class-manager] 调用宿主 class.create 失败，回退为插件自有班级: ${errMsg(e)}`);
         }
 
-        // 2. 写入插件增强表
+        // 2. 写入插件增强表（code/grade 等扩展字段宿主 classes 表不具备，仅插件侧保存）
         await database.prepare(
           `INSERT OR REPLACE INTO ${classesTable} (id, name, code, grade, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
         ).run(id, name, code, payload.grade || '', payload.description || '', now, now);
@@ -562,49 +651,83 @@ export default {
         const now = Date.now();
         let inserted = 0;
 
-        await withTransaction(database, async () => {
-          for (const stu of payload.students) {
-            // 1. 检查宿主原生 students 表是否已有该学生
-            let existingStudent = (await database.prepare(`SELECT id FROM students WHERE student_number = ? OR name = ?`).get(stu.studentNo, stu.name)) as any;
-            let targetStudentId = existingStudent ? existingStudent.id : crypto.randomUUID();
-
-            if (!existingStudent) {
-              try {
-                await database.prepare(`INSERT OR REPLACE INTO students (id, student_number, name, email, created_at) VALUES (?, ?, ?, ?, ?)`).run(
-                  targetStudentId,
-                  stu.studentNo,
-                  stu.name,
-                  '',
-                  now
-                );
-              } catch (_) {}
+        // 1. 通过宿主命令拉取全部学生，内存建「学号 → id」映射（避免逐条直读宿主表）
+        const hostStudentByNo = new Map<string, string>();
+        try {
+          const listCmd = await commandBus.createCommand('student.list', {}, ctx.pluginId);
+          const listRes = (await commandBus.execute(listCmd)) as any;
+          const hostRows = listRes?.students;
+          if (Array.isArray(hostRows)) {
+            for (const s of hostRows) {
+              if (s.student_number) {
+                hostStudentByNo.set(String(s.student_number), s.id);
+              }
             }
-
-            // 2. 关联到宿主原生 class_students 选课表
-            try {
-              await database.prepare(`INSERT OR REPLACE INTO class_students (class_id, student_id, joined_at) VALUES (?, ?, ?)`).run(
-                payload.classId,
-                targetStudentId,
-                now
-              );
-            } catch (_) {}
-
-            // 3. 写入插件扩展 students 表（增强积分、分组与画像）
-            await database.prepare(
-              `INSERT OR REPLACE INTO ${studentsTable} (id, class_id, student_no, name, gender, points, tags, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)`
-            ).run(
-              targetStudentId,
-              payload.classId,
-              stu.studentNo,
-              stu.name,
-              stu.gender || 'other',
-              JSON.stringify(stu.tags || []),
-              now
-            );
-
-            inserted++;
           }
-        });
+        } catch (e) {
+          ctx.log.warn(`[class-manager] 拉取宿主学生列表失败，导入将按新学生处理: ${errMsg(e)}`);
+        }
+
+        // 2. 逐条创建/复用宿主学生并关联到班级（命令均幂等，失败可安全重试）
+        for (const stu of payload.students) {
+          const studentNo = (stu.studentNo || '').trim() || `S-${now.toString().slice(-6)}-${Math.floor(1000 + Math.random() * 9000)}`;
+          let targetStudentId = hostStudentByNo.get(studentNo) || null;
+
+          if (!targetStudentId) {
+            try {
+              const createCmd = await commandBus.createCommand(
+                'student.create',
+                { name: stu.name, student_number: studentNo },
+                ctx.pluginId
+              );
+              const createRes = (await commandBus.execute(createCmd)) as any;
+              targetStudentId = createRes?.studentId || null;
+              if (targetStudentId) {
+                hostStudentByNo.set(studentNo, targetStudentId);
+              }
+            } catch (e) {
+              ctx.log.warn(`[class-manager] 创建宿主学生失败（${stu.name}）: ${errMsg(e)}`);
+            }
+          }
+
+          if (!targetStudentId) {
+            // 宿主学生创建失败，回退为插件自有 UUID（仍写插件表，保证花名册可用）
+            targetStudentId = crypto.randomUUID();
+          }
+
+          // 3. 通过宿主命令关联到班级（UNIQUE 冲突自动忽略，幂等）
+          try {
+            const addCmd = await commandBus.createCommand(
+              'class.add_student',
+              { classId: payload.classId, studentId: targetStudentId },
+              ctx.pluginId
+            );
+            await commandBus.execute(addCmd);
+          } catch (e) {
+            ctx.log.warn(`[class-manager] 关联学生到班级失败（${stu.name}）: ${errMsg(e)}`);
+          }
+
+          // 4. 写入插件扩展 students 表（UPSERT：保留已有积分/分组，仅刷新姓名/学号/性别/标签/班级）
+          await database.prepare(
+            `INSERT INTO ${studentsTable} (id, class_id, student_no, name, gender, points, tags, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               class_id = excluded.class_id,
+               student_no = excluded.student_no,
+               name = excluded.name,
+               gender = excluded.gender,
+               tags = excluded.tags`
+          ).run(
+            targetStudentId,
+            payload.classId,
+            studentNo,
+            stu.name,
+            stu.gender || 'other',
+            JSON.stringify(stu.tags || []),
+            now
+          );
+
+          inserted++;
+        }
 
         await eventBus.publish({
           id: crypto.randomUUID(),
@@ -644,7 +767,7 @@ export default {
               groupId: row.group_id,
               groupName: row.group_name,
               points: row.points || 0,
-              tags: row.tags ? JSON.parse(row.tags) : [],
+              tags: parseTags(row.tags),
               avatar: row.avatar,
               createdAt: row.created_at,
             });
@@ -790,7 +913,10 @@ export default {
         const database = await getDb();
         const now = Date.now();
         const results: { studentId: string; name: string; points: number }[] = [];
+        const ledgerWrites: { studentId: string; classId: string; name: string; points: number }[] = [];
 
+        // 事务内仅执行同步 SQL（better-sqlite3 事务不可包含异步 I/O）；
+        // 事件发布与宿主积分账本写入统一移出到事务提交后，避免并发交错。
         await withTransaction(database, async () => {
           for (const sId of payload.studentIds) {
             let existing = (await database.prepare(`SELECT * FROM ${studentsTable} WHERE id = ?`).get(sId)) as any;
@@ -813,38 +939,42 @@ export default {
             const updated = (await database.prepare(`SELECT * FROM ${studentsTable} WHERE id = ?`).get(sId)) as any;
             if (updated) {
               results.push({ studentId: sId, name: updated.name, points: updated.points });
-              await eventBus.publish({
-                id: crypto.randomUUID(),
-                type: 'class_mgr.points_changed',
-                source: 'plugin.class_mgr',
-                payload: {
-                  studentId: sId,
-                  studentName: updated.name,
-                  delta: payload.delta,
-                  currentPoints: updated.points,
-                  reason: payload.reason,
-                },
-                timestamp: now,
-                correlationId: command.id,
-              });
-              // 尽力写入宿主积分账本（审计可追溯）
-              try {
-                if (pointsLedger) {
-                  await pointsLedger.addPoints(
-                    sId,
-                    updated.class_id || '',
-                    pointsDimensionId,
-                    payload.delta,
-                    payload.reason || '课堂加减分',
-                    ctx.pluginId
-                  );
-                }
-              } catch (e) {
-                ctx.log.debug(`[class-manager] 同步宿主积分账本失败: ${errMsg(e)}`);
-              }
+              ledgerWrites.push({ studentId: sId, classId: updated.class_id || '', name: updated.name, points: updated.points });
             }
           }
         });
+
+        // 事务提交后统一发布事件与写入宿主积分账本（审计可追溯）
+        for (const item of ledgerWrites) {
+          await eventBus.publish({
+            id: crypto.randomUUID(),
+            type: 'class_mgr.points_changed',
+            source: 'plugin.class_mgr',
+            payload: {
+              studentId: item.studentId,
+              studentName: item.name,
+              delta: payload.delta,
+              currentPoints: item.points,
+              reason: payload.reason,
+            },
+            timestamp: now,
+            correlationId: command.id,
+          });
+          try {
+            if (pointsLedger) {
+              await pointsLedger.addPoints(
+                item.studentId,
+                item.classId,
+                pointsDimensionId,
+                payload.delta,
+                payload.reason || '课堂加减分',
+                ctx.pluginId
+              );
+            }
+          } catch (e) {
+            ctx.log.debug(`[class-manager] 同步宿主积分账本失败: ${errMsg(e)}`);
+          }
+        }
 
         return {
           count: results.length,
@@ -901,7 +1031,7 @@ export default {
           }
 
           // 按方法分配：random=随机洗牌均分；gender_balance=性别交错均分（各组性别均衡）
-          const shuffled = [...students].sort(() => Math.random() - 0.5);
+          const shuffled = shuffle(students);
           const ordered = payload.method === 'gender_balance' ? interleaveByGender(shuffled) : shuffled;
           for (let idx = 0; idx < ordered.length; idx++) {
             const stu = ordered[idx];
@@ -979,7 +1109,7 @@ export default {
         }
 
         const pickCount = Math.min(Math.max(1, Math.floor(payload.count || 1)), candidates.length);
-        const shuffled = [...candidates].sort(() => Math.random() - 0.5);
+        const shuffled = shuffle(candidates);
         const picked = shuffled.slice(0, pickCount);
         const now = Date.now();
 
@@ -1148,7 +1278,7 @@ export default {
 
         const attendanceRate = totalRecords > 0
           ? Math.round(((presentCount + lateCount * 0.8) / totalRecords) * 1000) / 10
-          : 100.0;
+          : null;
 
         const ptsStatsRow = await database.prepare(`
           SELECT 
@@ -1182,7 +1312,7 @@ export default {
             totalPoints: ptsStatsRow?.total_points || 0,
           },
           topActiveStudents: Array.isArray(topStudents) ? topStudents.map((s) => ({ name: s.name, points: s.points || 0 })) : [],
-          summaryText: `班级「${className}」共有学生 ${studentCountRow?.count || 0} 人，分为 ${groupCountRow?.count || 0} 个教学小组。加权出勤率为 ${attendanceRate}%，平均课堂积分为 ${Math.round((ptsStatsRow?.avg_points || 0) * 10) / 10} 分。`,
+          summaryText: `班级「${className}」共有学生 ${studentCountRow?.count || 0} 人，分为 ${groupCountRow?.count || 0} 个教学小组。加权出勤率为 ${attendanceRate == null ? '暂无数据' : attendanceRate + '%'}，平均课堂积分为 ${Math.round((ptsStatsRow?.avg_points || 0) * 10) / 10} 分。`,
         };
 
         return summary;
@@ -1249,7 +1379,7 @@ export default {
       inputSchema: {
         type: 'OBJECT',
         properties: {
-          studentIds: { type: 'ARRAY', description: '学生 ID 列表' },
+          studentIds: { type: 'ARRAY', description: '学生 ID 列表', items: { type: 'STRING' } },
           delta: { type: 'INTEGER', description: '积分变动值 (如 2, 3, -1)' },
           reason: { type: 'STRING', description: '加减分理由' },
         },
