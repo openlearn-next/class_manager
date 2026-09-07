@@ -1,6 +1,6 @@
 {
   "name": "openlearn-plugin-class-manager",
-  "version": "0.3.9",
+  "version": "0.3.12",
   "private": true,
   "type": "module",
   "description": "增强班级花名册、分组、课堂点名考勤与学生积分管理的 OpenLearn-Next 全栈插件",

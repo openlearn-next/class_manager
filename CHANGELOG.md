@@ -4,6 +4,13 @@
 
 ---
 
+## [0.3.12] - 2026-09-06
+
+### 🐛 修复 (Bug Fixes)
+
+- **修复"班级与学生管理中心无法显示和管理当前系统已存在班级"的根因**：插件调用 `commandBus.createCommand(...)` 时把 `ctx.pluginId`（插件 DB UUID，如 `019f6029-...`）作为 actorId 传入。但宿主的 `CapabilityGuard` 在 `activate` 时是把 `manifest.capabilitiesProposed` 授权给 `plugin:${manifest.id}`（如 `plugin:@ext/class-manager`）。两个 actorId 命名空间不一致，cap check 永远查不到授权，所有宿主命令（`class.list`、`student.list`、`whiteboard.*`、`class.create`、`student.create`、`class.add_student`）被 `[CapabilityGuard] Access Denied` 静默拒绝。`class_mgr.class_list` 的第一步直查 `classes` 表也在 Worker 模式下被 `assertDatabaseAccessAllowed` 黑名单拦下。两路兜底全部失败 → 前端拿到空班级列表 → 用户看不到、也无法管理已存在班级。修复方式：在 `activate` 顶部统一以 `plugin:${ctx.manifest.id}` 作为 actorId（与宿主 cap grant 同名命名空间），替换 15 处 actorId 位置的 `ctx.pluginId`；同步修复 `pointsLedger.record` 调用。
+- **class_list 三路兜底改为 `ctx.log.warn` 可见日志**：原本三路失败的 `} catch (_) {}` 静默吞错，掩盖了 cap check / 黑名单等根因；改为带路径编号（路径1 直查、路径2 命令总线、路径3 插件私有表）的 warn 日志，方便后续类似问题定位。
+
 ## [0.3.11] - 2026-09-06
 
 ### 🐛 修复 (Bug Fixes)

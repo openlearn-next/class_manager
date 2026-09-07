@@ -62,7 +62,7 @@ export default {
   manifest: {
     id: '@ext/class-manager',
     name: '班级与学生管理增强',
-    version: '0.3.9',
+    version: '0.3.12',
     main: 'index.js',
     description: '提供班级花名册导入、智能分组、互动白板课堂单个/批量加减分、小组PK激励、原子白板投射与真实学情聚合统计',
     author: 'OpenLearn',
@@ -134,6 +134,14 @@ export default {
     const actionRegistry = ctx.services.actionRegistry;
     const eventBus = ctx.services.eventBus;
     activeServices = { commandBus, actionRegistry };
+
+    // 统一的命令 actorId：ctx.pluginId 实际为插件 DB UUID（如 019f6029-...），而宿主的 CapabilityGuard
+    // 在 activate 时把 manifest.capabilitiesProposed 授予 `plugin:${manifest.id}` 这一 actorId。
+    // 若直接传 ctx.pluginId，cap check 会以 DB UUID 查表 → 永远无授权 → 任何宿主命令（含 class.list、
+    // student.list、whiteboard.*、class.create 等）都会被 [CapabilityGuard] Access Denied 静默拒绝，
+    // 导致 class_mgr.class_list 内部的命令 fallback 也拿不到宿主班级，最终前端显示空列表。
+    // 故所有 commandBus.createCommand 的 actorId 必须使用与 cap grant 同名的命名空间前缀。
+    const pluginActorId = `plugin:${ctx.manifest.id}`;
 
     // 将未知类型错误转为可读字符串（ctx.log 的 meta 参数要求 Record<string, unknown>）
     const errMsg = (err: unknown): string => (err instanceof Error ? err.message : String(err));
@@ -253,7 +261,7 @@ export default {
       // 1. 班级同步：比对插件表与宿主 class.list，缺失的补建并级联更新插件表引用
       const hostClassIds = new Set<string>();
       try {
-        const listCmd = await commandBus.createCommand('class.list', {}, ctx.pluginId);
+        const listCmd = await commandBus.createCommand('class.list', {}, pluginActorId);
         const listRes = (await commandBus.execute(listCmd)) as any;
         for (const c of listRes?.classes || []) {
           if (c.id) hostClassIds.add(c.id);
@@ -272,7 +280,7 @@ export default {
           const createCmd = await commandBus.createCommand(
             'class.create',
             { name: cls.name, description: cls.description || '' },
-            ctx.pluginId
+            pluginActorId
           );
           const createRes = (await commandBus.execute(createCmd)) as any;
           if (createRes?.classId && createRes.classId !== cls.id) {
@@ -290,7 +298,7 @@ export default {
       // 2. 学生同步：比对插件表与宿主 student.list，缺失的补建并级联更新插件表引用
       const hostStudentIds = new Set<string>();
       try {
-        const listCmd = await commandBus.createCommand('student.list', {}, ctx.pluginId);
+        const listCmd = await commandBus.createCommand('student.list', {}, pluginActorId);
         const listRes = (await commandBus.execute(listCmd)) as any;
         for (const s of listRes?.students || []) {
           if (s.id) hostStudentIds.add(s.id);
@@ -309,7 +317,7 @@ export default {
           const createCmd = await commandBus.createCommand(
             'student.create',
             { name: stu.name, student_number: stu.student_no || '' },
-            ctx.pluginId
+            pluginActorId
           );
           const createRes = (await commandBus.execute(createCmd)) as any;
           const newStudentId = createRes?.studentId || stu.id;
@@ -323,7 +331,7 @@ export default {
               const addCmd = await commandBus.createCommand(
                 'class.add_student',
                 { classId: stu.class_id, studentId: newStudentId },
-                ctx.pluginId
+                pluginActorId
               );
               await commandBus.execute(addCmd);
             } catch (e) {
@@ -418,7 +426,7 @@ export default {
             const queryCmd = await commandBus.createCommand(
               'whiteboard.query',
               { lessonId, filter: { type: elementType } },
-              ctx.pluginId
+              pluginActorId
             );
             const queryRes = (await commandBus.execute(queryCmd)) as any;
             const rows = queryRes?.elements;
@@ -443,14 +451,14 @@ export default {
             const updCmd = await commandBus.createCommand(
               'whiteboard.update',
               { lessonId, elementId, data: dataStr },
-              ctx.pluginId
+              pluginActorId
             );
             await commandBus.execute(updCmd);
           } else {
             const drawCmd = await commandBus.createCommand(
               'whiteboard.draw',
               { lessonId, type: elementType, data: dataStr },
-              ctx.pluginId
+              pluginActorId
             );
             const drawRes = (await commandBus.execute(drawCmd)) as any;
             elementId = drawRes?.elementId || elementId;
@@ -519,7 +527,7 @@ export default {
           const hostCmd = await commandBus.createCommand(
             'class.create',
             { name, description: payload.description || '' },
-            ctx.pluginId
+            pluginActorId
           );
           const hostRes = (await commandBus.execute(hostCmd)) as any;
           if (hostRes?.classId) {
@@ -575,12 +583,16 @@ export default {
               });
             }
           }
-        } catch (_) {}
+        } catch (e) {
+          // Worker 模式下宿主核心表被 assertDatabaseAccessAllowed 黑名单拦截属预期降级路径；
+          // 但记录 warn 以便排查非预期失败。
+          ctx.log.warn(`[class-manager] class_list 路径1 (直查宿主 classes 表) 失败: ${errMsg(e)}`);
+        }
 
         // 2. 兜底方案：通过宿主全局命令 class.list 获取
         if (classMap.size === 0) {
           try {
-            const hostCmd = await commandBus.createCommand('class.list', {}, ctx.pluginId);
+            const hostCmd = await commandBus.createCommand('class.list', {}, pluginActorId);
             const cmdRes = (await commandBus.execute(hostCmd)) as any;
             if (cmdRes?.classes && Array.isArray(cmdRes.classes)) {
               for (const c of cmdRes.classes) {
@@ -596,7 +608,10 @@ export default {
                 });
               }
             }
-          } catch (_) {}
+          } catch (e) {
+            // 通常为 CapabilityGuard 拒绝；actorId 不匹配 cap grant 时常见此处告警。
+            ctx.log.warn(`[class-manager] class_list 路径2 (命令总线 class.list) 失败: ${errMsg(e)}`);
+          }
         }
 
         // 3. 查询插件自建/增强 classes 表（await 异步 RPC）
@@ -621,7 +636,9 @@ export default {
               });
             }
           }
-        } catch (_) {}
+        } catch (e) {
+          ctx.log.warn(`[class-manager] class_list 路径3 (插件私有 classes 表) 失败: ${errMsg(e)}`);
+        }
 
         return Array.from(classMap.values());
       },
@@ -654,7 +671,7 @@ export default {
         // 1. 通过宿主命令拉取全部学生，内存建「学号 → id」映射（避免逐条直读宿主表）
         const hostStudentByNo = new Map<string, string>();
         try {
-          const listCmd = await commandBus.createCommand('student.list', {}, ctx.pluginId);
+          const listCmd = await commandBus.createCommand('student.list', {}, pluginActorId);
           const listRes = (await commandBus.execute(listCmd)) as any;
           const hostRows = listRes?.students;
           if (Array.isArray(hostRows)) {
@@ -678,7 +695,7 @@ export default {
               const createCmd = await commandBus.createCommand(
                 'student.create',
                 { name: stu.name, student_number: studentNo },
-                ctx.pluginId
+                pluginActorId
               );
               const createRes = (await commandBus.execute(createCmd)) as any;
               targetStudentId = createRes?.studentId || null;
@@ -700,7 +717,7 @@ export default {
             const addCmd = await commandBus.createCommand(
               'class.add_student',
               { classId: payload.classId, studentId: targetStudentId },
-              ctx.pluginId
+              pluginActorId
             );
             await commandBus.execute(addCmd);
           } catch (e) {
@@ -860,7 +877,7 @@ export default {
               pointsDimensionId,
               payload.delta,
               payload.reason || '课堂加减分',
-              ctx.pluginId
+              pluginActorId
             );
           }
         } catch (e) {
@@ -968,7 +985,7 @@ export default {
                 pointsDimensionId,
                 payload.delta,
                 payload.reason || '课堂加减分',
-                ctx.pluginId
+                pluginActorId
               );
             }
           } catch (e) {
