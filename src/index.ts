@@ -62,7 +62,7 @@ export default {
   manifest: {
     id: '@ext/class-manager',
     name: '班级与学生管理增强',
-    version: '0.3.12',
+    version: '0.3.13',
     main: 'index.js',
     description: '提供班级花名册导入、智能分组、互动白板课堂单个/批量加减分、小组PK激励、原子白板投射与真实学情聚合统计',
     author: 'OpenLearn',
@@ -640,7 +640,46 @@ export default {
           ctx.log.warn(`[class-manager] class_list 路径3 (插件私有 classes 表) 失败: ${errMsg(e)}`);
         }
 
-        return Array.from(classMap.values());
+        // 4. 校准宿主班级的真实学生人数：若人数为 0，通过 class.get_students 命令获取并同步
+        const classList = Array.from(classMap.values());
+        await Promise.all(
+          classList.map(async (cls) => {
+            if ((cls.studentCount || 0) > 0) return;
+
+            // 先查插件私有表看是否已有学生
+            try {
+              const localCountRow = await database.prepare(`SELECT COUNT(*) as count FROM ${studentsTable} WHERE class_id = ?`).get(cls.id);
+              if (localCountRow?.count > 0) {
+                cls.studentCount = localCountRow.count;
+                return;
+              }
+            } catch (_) {}
+
+            // 通过宿主命令 class.get_students 降级获取宿主班级中的学生
+            try {
+              const getStuCmd = await commandBus.createCommand('class.get_students', { classId: cls.id }, pluginActorId);
+              const getStuRes = (await commandBus.execute(getStuCmd)) as any;
+              if (getStuRes?.students && Array.isArray(getStuRes.students)) {
+                cls.studentCount = getStuRes.students.length;
+
+                // 增量同步宿主学生到插件私有表，赋默认积分与标签
+                const now = Date.now();
+                for (const hs of getStuRes.students) {
+                  const stuNo = hs.student_number || `S-${hs.id.slice(0, 4)}`;
+                  try {
+                    await database.prepare(
+                      `INSERT OR IGNORE INTO ${studentsTable} (id, class_id, student_no, name, gender, points, tags, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)`
+                    ).run(hs.id, cls.id, stuNo, hs.name, 'other', '[]', now);
+                  } catch (_) {}
+                }
+              }
+            } catch (e) {
+              ctx.log.debug(`[class-manager] class_list 校准班级 (${cls.name}) 学生数失败: ${errMsg(e)}`);
+            }
+          })
+        );
+
+        return classList;
       },
     });
 
@@ -791,40 +830,55 @@ export default {
           }
         }
 
-        // 2. 如果是宿主原生班级，查询宿主 class_students 与 students 表中尚未同步进来的学生（await 异步 RPC）
+        // 2. 查询宿主原生班级中尚未同步进来的学生（优先直查，受限时降级走命令总线 class.get_students）
+        let hostStudentRows: any[] = [];
         try {
-          const hostStudentRows = await database.prepare(
+          hostStudentRows = (await database.prepare(
             `SELECT s.id, s.student_number, s.name, s.email, cs.joined_at 
              FROM class_students cs 
              JOIN students s ON cs.student_id = s.id 
              WHERE cs.class_id = ?`
-          ).all(payload.classId) as any[];
+          ).all(payload.classId)) as any[];
+        } catch (e) {
+          ctx.log.debug(`[class-manager] student_list 直查宿主表受限: ${errMsg(e)}，降级至命令总线`);
+        }
 
-          if (Array.isArray(hostStudentRows)) {
-            const now = Date.now();
-            for (const hs of hostStudentRows) {
-              if (!studentMap.has(hs.id)) {
-                const stuNo = hs.student_number || `S-${hs.id.slice(0, 4)}`;
-                try {
-                  await database.prepare(
-                    `INSERT OR IGNORE INTO ${studentsTable} (id, class_id, student_no, name, gender, points, tags, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)`
-                  ).run(hs.id, payload.classId, stuNo, hs.name, 'other', '[]', now);
-                } catch (_) {}
+        if (!Array.isArray(hostStudentRows) || hostStudentRows.length === 0) {
+          try {
+            const getStuCmd = await commandBus.createCommand('class.get_students', { classId: payload.classId }, pluginActorId);
+            const stuRes = (await commandBus.execute(getStuCmd)) as any;
+            if (stuRes?.students && Array.isArray(stuRes.students)) {
+              hostStudentRows = stuRes.students;
+            }
+          } catch (e) {
+            ctx.log.warn(`[class-manager] student_list 命令总线 class.get_students 失败: ${errMsg(e)}`);
+          }
+        }
 
-                studentMap.set(hs.id, {
-                  id: hs.id,
-                  classId: payload.classId,
-                  studentNo: stuNo,
-                  name: hs.name,
-                  gender: 'other',
-                  points: 0,
-                  tags: ['宿主原生学生'],
-                  createdAt: hs.joined_at || now,
-                });
-              }
+        if (Array.isArray(hostStudentRows)) {
+          const now = Date.now();
+          for (const hs of hostStudentRows) {
+            if (!studentMap.has(hs.id)) {
+              const stuNo = hs.student_number || `S-${hs.id.slice(0, 4)}`;
+              try {
+                await database.prepare(
+                  `INSERT OR IGNORE INTO ${studentsTable} (id, class_id, student_no, name, gender, points, tags, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)`
+                ).run(hs.id, payload.classId, stuNo, hs.name, 'other', '[]', now);
+              } catch (_) {}
+
+              studentMap.set(hs.id, {
+                id: hs.id,
+                classId: payload.classId,
+                studentNo: stuNo,
+                name: hs.name,
+                gender: 'other',
+                points: 0,
+                tags: ['宿主原生学生'],
+                createdAt: hs.joined_at || now,
+              });
             }
           }
-        } catch (_) {}
+        }
 
         return Array.from(studentMap.values());
       },
@@ -851,17 +905,32 @@ export default {
         let existing = (await database.prepare(`SELECT * FROM ${studentsTable} WHERE id = ?`).get(payload.studentId)) as any;
         if (!existing) {
           // 若插件表中尚未有该学生（例如宿主原生录入的学生），自动增量同步
+          let hostStu: any = null;
+          let hostClassId = '';
           try {
-            const hostStu = (await database.prepare(`SELECT * FROM students WHERE id = ?`).get(payload.studentId)) as any;
+            hostStu = (await database.prepare(`SELECT * FROM students WHERE id = ?`).get(payload.studentId)) as any;
             if (hostStu) {
               const stuClass = (await database.prepare(`SELECT class_id FROM class_students WHERE student_id = ?`).get(payload.studentId)) as any;
-              const classId = stuClass?.class_id || '';
-              const stuNo = hostStu.student_number || `S-${hostStu.id.slice(0, 4)}`;
-              await database.prepare(
-                `INSERT INTO ${studentsTable} (id, class_id, student_no, name, gender, points, tags, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-              ).run(hostStu.id, classId, stuNo, hostStu.name, 'other', payload.delta, '[]', now);
+              hostClassId = stuClass?.class_id || '';
             }
           } catch (_) {}
+
+          if (!hostStu) {
+            try {
+              const listCmd = await commandBus.createCommand('student.list', {}, pluginActorId);
+              const listRes = (await commandBus.execute(listCmd)) as any;
+              if (Array.isArray(listRes?.students)) {
+                hostStu = listRes.students.find((s: any) => s.id === payload.studentId);
+              }
+            } catch (_) {}
+          }
+
+          if (hostStu) {
+            const stuNo = hostStu.student_number || `S-${hostStu.id.slice(0, 4)}`;
+            await database.prepare(
+              `INSERT OR IGNORE INTO ${studentsTable} (id, class_id, student_no, name, gender, points, tags, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+            ).run(hostStu.id, hostClassId, stuNo, hostStu.name, 'other', payload.delta, '[]', now);
+          }
         } else {
           await database.prepare(`UPDATE ${studentsTable} SET points = points + ? WHERE id = ?`).run(payload.delta, payload.studentId);
         }
@@ -932,26 +1001,37 @@ export default {
         const results: { studentId: string; name: string; points: number }[] = [];
         const ledgerWrites: { studentId: string; classId: string; name: string; points: number }[] = [];
 
+        // 事务前检查：若有尚未存在于插件表的宿主学生，统一从宿主命令拉取补齐
+        const missingStudentIds: string[] = [];
+        for (const sId of payload.studentIds) {
+          const row = (await database.prepare(`SELECT id FROM ${studentsTable} WHERE id = ?`).get(sId)) as any;
+          if (!row) {
+            missingStudentIds.push(sId);
+          }
+        }
+        if (missingStudentIds.length > 0) {
+          try {
+            const listCmd = await commandBus.createCommand('student.list', {}, pluginActorId);
+            const listRes = (await commandBus.execute(listCmd)) as any;
+            if (Array.isArray(listRes?.students)) {
+              for (const missingId of missingStudentIds) {
+                const s = listRes.students.find((stu: any) => stu.id === missingId);
+                if (s) {
+                  const stuNo = s.student_number || `S-${s.id.slice(0, 4)}`;
+                  await database.prepare(
+                    `INSERT OR IGNORE INTO ${studentsTable} (id, class_id, student_no, name, gender, points, tags, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)`
+                  ).run(s.id, '', stuNo, s.name, 'other', '[]', now);
+                }
+              }
+            }
+          } catch (_) {}
+        }
+
         // 事务内仅执行同步 SQL（better-sqlite3 事务不可包含异步 I/O）；
         // 事件发布与宿主积分账本写入统一移出到事务提交后，避免并发交错。
         await withTransaction(database, async () => {
           for (const sId of payload.studentIds) {
-            let existing = (await database.prepare(`SELECT * FROM ${studentsTable} WHERE id = ?`).get(sId)) as any;
-            if (!existing) {
-              try {
-                const hostStu = (await database.prepare(`SELECT * FROM students WHERE id = ?`).get(sId)) as any;
-                if (hostStu) {
-                  const stuClass = (await database.prepare(`SELECT class_id FROM class_students WHERE student_id = ?`).get(sId)) as any;
-                  const classId = stuClass?.class_id || '';
-                  const stuNo = hostStu.student_number || `S-${hostStu.id.slice(0, 4)}`;
-                  await database.prepare(
-                    `INSERT INTO ${studentsTable} (id, class_id, student_no, name, gender, points, tags, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-                  ).run(hostStu.id, classId, stuNo, hostStu.name, 'other', payload.delta, '[]', now);
-                }
-              } catch (_) {}
-            } else {
-              await database.prepare(`UPDATE ${studentsTable} SET points = points + ? WHERE id = ?`).run(payload.delta, sId);
-            }
+            await database.prepare(`UPDATE ${studentsTable} SET points = points + ? WHERE id = ?`).run(payload.delta, sId);
 
             const updated = (await database.prepare(`SELECT * FROM ${studentsTable} WHERE id = ?`).get(sId)) as any;
             if (updated) {

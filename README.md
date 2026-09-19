@@ -61,6 +61,6 @@ npm run build
 
 ## 📄 架构声明 (Manifest)
 - **ID**: `@ext/class-manager`
-- **版本**: `0.3.9`
+- **版本**: `0.3.13`
 - **适配引擎**: `openlearn: ">=0.2.5"`
 - **权限需求**: `lesson:read`, `lesson:write`, `whiteboard:write`, `management:read`, `management:write`

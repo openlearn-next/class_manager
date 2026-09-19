@@ -4,6 +4,32 @@
 
 ---
 
+## [0.3.13] - 2026-09-19
+
+### 🐛 修复 (Bug Fixes)
+
+- **修复宿主系统班级学生人数始终显示为 0 的问题 (Zero Student Count Issue)**：
+  - **根因分析**：在 Worker 插件隔离运行环境下，宿主底层安全守卫 `ServiceHost.assertDatabaseAccessAllowed` 严格禁止插件通过裸 SQL 访问 `classes`、`students`、`class_students` 等核心表；`class_mgr.class_list` 路径 1（跨表直查）被安全拦截后降级走路径 2（宿主全局命令 `class.list`）。虽然成功拉取到宿主班级列表，但宿主 `class.list` 命令本身仅返回班级主表数据而不统计学生数，插件在路径 2 中硬编码赋值 `studentCount: 0`，且后续未进行学生数补充校准。
+  - **修复实施**：在 `class_mgr.class_list` 结尾加入并发校准机制。对私有增强表中学生数为 0 的宿主班级，通过宿主官方命令 `class.get_students`（基于已声明的 `management:read` 权限）并发拉取真实学生记录，将 `studentCount` 校准为实际人数，并自动增量写入 `${studentsTable}` 缓存。
+- **修复宿主班级花名册为空、无法展示学生的问题 (Empty Roster Issue)**：
+  - **根因分析**：`class_mgr.student_list` 在插件私有增强表无记录时，原本尝试通过裸 SQL 跨表查询 `class_students` 与 `students` 表。Worker 隔离下该查询抛出 `WorkerCapabilityError` 并被 `catch (_) {}` 静默吞掉，且原本缺失命令总线降级逻辑，导致前端拿到的学生花名册始终为空数组。
+  - **修复实施**：为 `class_mgr.student_list` 补齐命令总线降级通道。当跨表直查受限时，自动无缝降级到宿主 `class.get_students` 命令拉取原生学生，并自动通过 `INSERT OR IGNORE` 写入插件增强表并赋予初始 0 积分与默认标签，确保花名册即时可见且支持后续点名与分组。
+- **优化积分调整中的原生学生解析机制 (Points Update Resilience)**：
+  - **根因分析**：在 `student_update_points` 与 `student_batch_update_points` 中，若针对尚未导入插件私有表的宿主原生学生操作，旧逻辑尝试通过裸 SQL 直查 `students` 核心表补建，在 Worker 模式下因安全拦截而导致补建失败。
+  - **修复实施**：全面剔除对宿主核心表的直接裸 SQL 依赖。单人积分更新时改用宿主 `student.list` 命令总线补齐学生基础档案；批量加减分中，在进入本地事务前预先检测缺失 ID 并通过一次批量 RPC 查询补齐学生，既遵循 SQLite 事务内纯同步约束，又保障 Worker 模式下加减分 100% 成功。
+
+### ⚡ 增强 (Enhancements)
+
+- **双源学生数据懒加载与缓存机制**：
+  - 在拉取班级列表或花名册的同时，自动以 `INSERT OR IGNORE` 形式将宿主学生轻量同步至插件本地增强表，避免后续的课堂随机点名、考勤打卡、分组与积分结算频繁进行跨进程 RPC。
+
+### 🛡️ 安全与兼容性 (Security & Compatibility)
+
+- **全面符合 Worker 沙箱核心表隔离规范**：
+  - 彻底规避对 `classes`、`students`、`class_students` 等宿主黑名单核心表的直接裸 SQL 访问，所有与平台交互的读写逻辑完全基于 `CapabilityGuard` 授权的官方命令（`class.list`、`class.get_students`、`student.list`、`class.create`、`student.create`、`class.add_student`），保障生产环境与沙箱环境下的高可靠性。
+
+---
+
 ## [0.3.12] - 2026-09-06
 
 ### 🐛 修复 (Bug Fixes)
