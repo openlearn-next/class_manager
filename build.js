@@ -5,6 +5,8 @@ import JSZip from 'jszip';
 
 async function build() {
   console.log('🚀 开始构建 OpenLearn 班级与学生管理插件...');
+  // 版本号以 package.json 为唯一来源，避免 manifest 与发布版本漂移
+  const pkg = JSON.parse(fs.readFileSync(path.resolve('package.json'), 'utf-8'));
   const distDir = path.resolve('dist');
   if (!fs.existsSync(distDir)) {
     fs.mkdirSync(distDir, { recursive: true });
@@ -42,7 +44,7 @@ async function build() {
   const manifest = {
     id: '@ext/class-manager',
     name: '班级与学生管理增强',
-    version: '0.3.12',
+    version: pkg.version,
     main: 'index.js',
     description: '提供班级花名册导入、智能分组、互动白板课堂单个/批量加减分、小组PK激励、原子白板投射与真实学情聚合统计',
     author: 'OpenLearn',
@@ -54,7 +56,15 @@ async function build() {
       '@openlearn/core:IDatabase@^1.0.0',
     ],
     pluginDependencies: ['@openlearn/plugin-management', '@openlearn/plugin-builtin'],
-    capabilitiesProposed: ['lesson:read', 'lesson:write', 'whiteboard:write', 'management:read', 'management:write'],
+    capabilitiesProposed: [
+      'lesson:read',
+      'lesson:write',
+      'whiteboard:write',
+      'management:read',
+      'management:write',
+      'student-data:read',
+      'student-data:write',
+    ],
     contributes: {
       'classroom.tool': [
         {

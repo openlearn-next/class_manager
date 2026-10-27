@@ -4,6 +4,13 @@
 
 ---
 
+## [0.3.14] - 2026-10-27
+
+### 🐛 修复 (Bug Fixes)
+
+- **ZIP 内 manifest 版本号与发布版本漂移**：`build.js` 此前硬编码 `version: '0.3.12'`，导致 0.3.13 发布的 ZIP 内 manifest 仍是 0.3.12。现改为从 `package.json` 读取版本号，单一来源不再漂移。
+- **manifest 补声明 `student-data:read` / `student-data:write` 能力**：宿主平台对 `IPointsLedgerService.addPoints` 施加 `student-data:write` 能力门禁（缺省抛 `PluginCapabilityDeniedError`）。本插件「课堂加减分」功能依赖 `addPoints`，但 capabilitiesProposed 只有 `whiteboard:write` / `management:*`，在新宿主上加减分会被拒绝。补声明后需管理员在审批 UI 确认授予。
+
 ## [0.3.13] - 2026-09-19
 
 ### 🐛 修复 (Bug Fixes)
